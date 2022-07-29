@@ -49,9 +49,6 @@ class BasicLogger(object):
                 self.id_val_fts[ft][1].append(mean)
                 #reset id_val_fts log
                 self.id_val_fts[ft][0] = []
-    
-    def show_embeddings(self, categories):
-        pass
 
 class IpynbLogger(BasicLogger):
     """Plots Logging Data in jupyter notebook"""
@@ -91,9 +88,7 @@ class IpynbLogger(BasicLogger):
             id_val_loss = np.array(id_val_loss).mean(axis=0)
             self.plt.plot(x, id_val_loss, label='identity val loss', color='pink')
 
-        #adjust ylim to display all data
-        max_y = max(max(id_val_loss), max(val_loss), max(train_loss), self.baseline_loss)
-        self.plt.ylim(0, max_y+.2)
+        self.plt.ylim(0, max(6, math.floor(2*self.baseline_loss)))
         self.plt.legend()
         self.plt.xlabel('epochs')
         self.plt.ylabel('loss')
