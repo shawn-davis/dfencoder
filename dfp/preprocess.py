@@ -10,6 +10,8 @@ import sys
 import argparse
 import json
 import boto3
+import tempfile
+import multiprocessing as mp
 
 
 parser = argparse.ArgumentParser(description="Process Duo or Azure logs for DFP")
@@ -19,8 +21,10 @@ parser.add_argument('--files', default=None, help='The directory or bucket conta
 parser.add_argument('--aws_key', default=None, help='The AWS Access key to use for s3 loading')
 parser.add_argument('--aws_secret', default=None, help='The AWS Secret key to use for s3 loading')
 parser.add_argument('--aws_token', default=None, help='The AWS Token to use for s3 loading')
+parser.add_argument('--temp_save_s3', default=None, help='Save the bucket contents to a temporary directory and process them locally')
 parser.add_argument('--save_dir', default=None, help='The directory to save the processed files')
-parser.add_argument('--filetype', default='csv', choices=['csv', 'json', 'jsonline'], help='Switch between csv and jsonlines for processing Azure logs')
+parser.add_argument('--filetype', default='csv', choices=['csv', 'json', 'jsonline', 'dict'], help='Switch between csv and jsonlines for processing Azure logs')
+parser.add_argument('--sep', default='_', help='The seperator between nested json keys')
 parser.add_argument('--explode_raw', action='store_true', help='Option to explode the _raw key from a jsonline file')
 parser.add_argument('--delimiter', default=',', help='The CSV delimiter in the files to be processed')
 parser.add_argument('--groupby', default=None, help='The column to be aggregated over. Usually a username.')
@@ -36,6 +40,16 @@ parser.add_argument('--min_records', type=int, default=0, help='The minimum numb
 
 _DEFAULT_DATE = '1970-01-01T00:00:00.000000+00:00'
 
+s3_session = None
+s3_client = None
+s3_resource = None
+def initialize_s3(aws_key, aws_secret, aws_token):
+    global s3_session
+    global s3_client
+    global s3_resource
+    s3_session = boto3.Session(aws_access_key_id=aws_key, aws_secret_access_key=aws_secret, aws_session_token=aws_token)
+    s3_client = s3_session.client('s3')
+    s3_resource = s3_session.resource('s3')
 
 def _if_dir_not_exists(directory):
     if not os.path.exists(directory):
@@ -46,6 +60,9 @@ def _explode_raw(df, sep):
     df2 = pd.json_normalize(df['_raw'].apply(json.loads), sep=sep)
     return df2
 
+def _nondask_explode_raw(file, sep):
+    pdf = pd.json_normalize(pd.read_json(file, lines=True)['_raw'].apply(json.loads), sep=sep)
+    return pdf
 
 def _derived_features(df, timestamp_column, city_column, state_column, country_column, application_column, normalize_strings):
     pdf = df.copy()
@@ -86,10 +103,10 @@ def _parse_time(df, timestamp_column):
     return pdf
 
 
-def _s3_load(access, secret, token, bucket, key, filetype, explode_raw, delimiter, sep):
-    session = boto3.Session(aws_access_key_id=access, aws_secret_access_key=secret, aws_session_token=token)
-    client = session.client('s3')
-    data = client.get_object(Bucket=bucket, Key=key)
+def _s3_load(bucket, key, filetype, explode_raw, delimiter, sep):
+    # session = boto3.Session(aws_access_key_id=access, aws_secret_access_key=secret, aws_session_token=token)
+    # client = session.client('s3')
+    data = s3_client.get_object(Bucket=bucket, Key=key)
     contents = data['Body']
     if filetype.startswith('json'):
         log = json.load(contents)
@@ -97,27 +114,45 @@ def _s3_load(access, secret, token, bucket, key, filetype, explode_raw, delimite
             pdf = pd.json_normalize(log['_raw'], sep=sep)
         else:
             pdf = pd.json_normalize(log, sep=sep)
+    elif filetype == 'dict':
+        log = json.load(contents)
+        pdf = pd.DataFrame.from_dict(log)
     else:
         pdf = pd.read_csv(contents, delimiter=delimiter).fillna
     return pdf
-
 
 def _load_json(file, sep):
     with open(file) as json_in:
         log = json.load(json_in)
     pdf = pd.json_normalize(log, sep=sep)
     return pdf
+
+def _load_dict(file, sep):
+    with open(file) as dict_in:
+        log = json.load(dict_in)
+    pdf_reoriented = pd.DataFrame.from_dict(log).to_dict('records')
+    pdf = pd.json_normalize(pdf_reoriented, sep=sep)
+    return pdf
+
+def _load_csv(file, delimiter):
+    return pd.read_csv(file, delimiter=delimiter)
     
+def _download_s3(job):
+    bucket, key, savepath = job
+    s3_client.download_file(bucket, key, savepath)
 
 def proc_logs(files, 
                 save_dir,
                 log_source = 'duo',
                 filetype = 'csv',
-                sep = '.',
+                sep = '_',
                 s3 = False,
                 aws_key = None,
                 aws_secret = None,
                 aws_token = None,
+                temp_save_s3 = None,
+                dask = True,
+                max_workers = 4,
                 explode_raw = False,
                 delimiter = ',',
                 groupby = 'userPrincipalName',
@@ -194,6 +229,10 @@ def proc_logs(files,
 
     _if_dir_not_exists(save_dir)
     
+    if temp_save_s3:
+        _if_dir_not_exists(temp_save_s3)
+        temp_dir = tempfile.TemporaryDirectory(dir=temp_save_s3)
+
     if s3:
         if '/' in files:
             split_bucket = files.split('/')
@@ -202,26 +241,44 @@ def proc_logs(files,
         else:
             bucket = files
             prefix = None
-        session = boto3.Session(aws_access_key_id=aws_key, aws_secret_access_key=aws_secret, aws_session_token=aws_token)
-        client = session.client('s3')
-        s3 = session.resource('s3')
+        # session = boto3.Session(aws_access_key_id=aws_key, aws_secret_access_key=aws_secret, aws_session_token=aws_token)
+        # client = session.client('s3')
+        # s3 = session.resource('s3')
+        initialize_s3(aws_key, aws_secret, aws_token)
         keys = []
         if prefix is not None:
-            for content in s3.Bucket(bucket).objects.filter(Prefix=prefix):
+            for content in s3_resource.Bucket(bucket).objects.filter(Prefix=prefix):
                 key = content.key
                 keys.append(key)
         else:
-            for content in s3.Bucket(bucket).objects.all():
+            for content in s3_resource.Bucket(bucket).objects.all():
                 key = content.key
                 if not key.startswith('/'):
                     keys.append(key)
         if extension is not None:
             keys = [key for key in keys if key.endswith(extension)]
-        assert len(keys) > 0, 'Please pass a directory, a file-path, or a list of file-paths containing the files to be processed'
-        dfs = [dask.delayed(_s3_load)(aws_key, aws_secret, aws_token, bucket, k, filetype, explode_raw, delimiter, sep) for k in keys]
-        ddfs = [dd.from_delayed(df) for df in dfs]
-        logs = dd.concat(ddfs).fillna('nan')
-    else:
+        assert len(keys) > 0, 'Please pass a bucket with correct prefixes containing the files to be processed'
+        if temp_save_s3:
+            jobs = [(bucket, k, os.path.join(temp_dir.name, k.split('/')[-1])) for k in keys]
+            # for k in keys:
+            #     s3_client.download_file(bucket, k, os.path.join(temp_dir.name, k.split('/')[-1]))
+            pool = mp.Pool(max_workers)
+            pool.map(_download_s3, jobs)
+            pool.close()
+            pool.join()
+            files = [os.path.join(temp_dir.name, file) for file in os.listdir(temp_dir.name)]
+        else:
+            if dask:
+                dfs = [dask.delayed(_s3_load)(bucket, k, filetype, explode_raw, delimiter, sep) for k in keys]
+                ddfs = [dd.from_delayed(df) for df in dfs]
+                logs = dd.concat(ddfs).fillna('nan')
+            else:
+                pool = mp.Pool(max_workers)
+                dfs = [pool.appy(_s3_load, args=(bucket, k ,filetype, explode_raw, delimiter, sep)) for k in keys]
+                logs = pd.concat(dfs).fillna('nan')
+                pool.close()
+                pool.join()
+    if not s3 or temp_save_s3:
         if isinstance(files, str):
             if os.path.isdir(files):
                 if extension is not None:
@@ -235,42 +292,94 @@ def proc_logs(files,
         assert isinstance(files, list) and len(files) > 0, 'Please pass a directory, a file-path, or a list of file-paths containing the files to be processed'
         if filetype == 'jsonline':
             if explode_raw:
-                nested_logs = dd.read_json(files, lines=True)
-                meta = pd.json_normalize(json.loads(nested_logs.head(1)['_raw'].to_list()[0]), sep=sep).iloc[:0,:].copy()
-                logs = nested_logs.map_partitions(lambda df: _explode_raw(df, sep), meta=meta).fillna('nan')
+                if dask:
+                    nested_logs = dd.read_json(files, lines=True)
+                    meta = pd.json_normalize(json.loads(nested_logs.head(1)['_raw'].to_list()[0]), sep=sep).iloc[:0,:].copy()
+                    logs = nested_logs.map_partitions(lambda df: _explode_raw(df, sep), meta=meta).fillna('nan')
+                else:
+                    pool = mp.Pool(max_workers)
+                    dfs = [pool.apply(_nondask_explode_raw, args=(file, sep)) for file in files]
+                    logs = pd.concat(dfs).fillna('nan')
+                    pool.close()
+                    pool.join()
             else:
+                if dask:
+                    dfs = [dask.delayed(_load_json)(x, sep) for x in files]
+                    # logs = dd.from_delayed(dfs, verify_meta=False)
+                    ddfs = [dd.from_delayed(df) for df in dfs]
+                    logs = dd.concat(ddfs).fillna('nan')
+                else:
+                    pool = mp.Pool(max_workers)
+                    dfs = [pool.apply(_load_json, args=(file, sep)) for file in files]
+                    logs = pd.concat(dfs).fillna('nan')
+                    pool.close()
+                    pool.join()
+        elif filetype == 'json':
+            if dask:
                 dfs = [dask.delayed(_load_json)(x, sep) for x in files]
                 # logs = dd.from_delayed(dfs, verify_meta=False)
                 ddfs = [dd.from_delayed(df) for df in dfs]
                 logs = dd.concat(ddfs).fillna('nan')
-        elif filetype == 'json':
-            dfs = [dask.delayed(_load_json)(x, sep) for x in files]
-            # logs = dd.from_delayed(dfs, verify_meta=False)
-            ddfs = [dd.from_delayed(df) for df in dfs]
-            logs = dd.concat(ddfs).fillna('nan')
+            else:
+                pool = mp.Pool(max_workers)
+                dfs = [pool.apply(_load_json, args=(file, sep)) for file in files]
+                logs = pd.concat(dfs).fillna('nan')
+                pool.close()
+                pool.join()
+        elif filetype == 'dict':
+            if dask:
+                dfs = [dask.delayed(_load_dict)(x, sep) for x in files]
+                ddfs = [dd.from_delayed(df) for df in dfs]
+                logs = dd.concat(ddfs).fillna('nan')
+            else:
+                pool = mp.Pool(max_workers)
+                dfs = [pool.apply(_load_dict, args=(file, sep)) for file in files]
+                logs = pd.concat(dfs).fillna('nan')
+                pool.close()
+                pool.join()
         else:
-            logs = dd.read_csv(files, delimiter=delimiter, dtype='object').fillna('nan')
+            if dask:
+                logs = dd.read_csv(files, delimiter=delimiter, dtype='object').fillna('nan')
+            else:
+                pool.mp.Pool(max_workers)
+                dfs = [pool.apply(_load_csv, args=(file, delimiter)) for file in files]
+                logs = pd.concat(dfs).fillna('nan')
+                pool.close()
+                pool.join()
 
-    logs_meta = {c: v for c, v in zip(logs._meta, logs._meta.dtypes)}
-    logs_meta['time'] = 'datetime64[ns]'
-    logs_meta['day'] = 'datetime64[ns]'
-    if city_column is not None or state_column is not None or country_column is not None:
-        logs_meta['locincrement'] = 'int'
-    if application_column is not None:
-        logs_meta['appincrement'] = 'int'
-    logs_meta['logcount'] = 'int'
+    if dask:
+        logs_meta = {c: v for c, v in zip(logs._meta, logs._meta.dtypes)}
+        logs_meta['time'] = 'datetime64[ns]'
+        logs_meta['day'] = 'datetime64[ns]'
+        if city_column is not None or state_column is not None or country_column is not None:
+            logs_meta['locincrement'] = 'int'
+        if application_column is not None:
+            logs_meta['appincrement'] = 'int'
+        logs_meta['logcount'] = 'int'
 
-    derived_logs = logs.groupby(groupby).apply(lambda df: _derived_features(df, timestamp_column, city_column, state_column, country_column, application_column, normalize_strings), meta=logs_meta).reset_index(drop=True)
+        derived_logs = logs.groupby(groupby).apply(lambda df: _derived_features(df, timestamp_column, city_column, state_column, country_column, application_column, normalize_strings), meta=logs_meta).reset_index(drop=True)
 
-    # derived_meta = derived_logs.head(1).iloc[:0,:].copy()
+        # derived_meta = derived_logs.head(1).iloc[:0,:].copy()
 
-    if min_records > 0:
-        logs = logs.persist()
-        user_entry_counts = logs[[groupby, timestamp_column]].groupby(groupby).count().compute()
-        trainees = [user for user, count in user_entry_counts.to_dict()[timestamp_column].items() if count > min_records]
-        derived_logs[derived_logs[groupby].isin(trainees)].groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source), meta=derived_logs._meta).size.compute()
+        if min_records > 0:
+            logs = logs.persist()
+            user_entry_counts = logs[[groupby, timestamp_column]].groupby(groupby).count().compute()
+            trainees = [user for user, count in user_entry_counts.to_dict()[timestamp_column].items() if count > min_records]
+            derived_logs[derived_logs[groupby].isin(trainees)].groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source), meta=derived_logs._meta).size.compute()
+        else:
+            derived_logs.groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source), meta=logs_meta).size.compute()
     else:
-        derived_logs.groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source), meta=derived_logs._meta).size.compute()
+        derived_logs = logs.groupby(groupby).apply(lambda df: _derived_features(df, timestamp_column, city_column, state_column, country_column, application_column, normalize_strings)).reset_index(drop=True)
+
+        if min_records > 0:
+            user_entry_counts = logs[[groupby, timestamp_column]].groupby(groupby).count()
+            trainees = [user for user, count in user_entry_counts.to_dict()[timestamp_column].items() if count > min_records]
+            derived_logs[derived_logs[groupby].isin(trainees)].groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source))
+        else:
+            derived_logs.groupby(output_grouping).apply(lambda df: _save_groups(df, save_dir, log_source))
+            
+    if temp_save_s3:
+        temp_dir.cleanup()
 
     timing = datetime.timedelta(seconds = time.perf_counter() - start_time)
 
@@ -285,18 +394,21 @@ def proc_logs(files,
 def _run():
     opt = parser.parse_args()
 
-    client = Client()
-    client.restart()
+    if opt.dask:
+        client = Client()
+        client.restart()
 
     print('Beginning {origin} pre-processing'.format(origin=opt.origin))
     proc_logs(files=opt.files, 
                         log_source=opt.origin,
                         save_dir=opt.save_dir,
                         filetype=opt.filetype,
+                        sep=opt.sep,
                         s3=opt.s3,
                         aws_key=opt.aws_key,
                         aws_secret=opt.aws_secret,
                         aws_token=opt.aws_token,
+                        temp_save_s3=opt.temp_save_s3,
                         explode_raw=opt.explode_raw,
                         delimiter=opt.delimiter, 
                         groupby=opt.groupby or 'userPrincipalName',
@@ -309,7 +421,8 @@ def _run():
                         extension=opt.extension,
                         min_records=opt.min_records)
     
-    client.close()
+    if opt.dask:
+        client.close()
 
 if __name__ == '__main__':
     _run()
